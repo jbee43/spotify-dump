@@ -1,0 +1,36 @@
+name: Token Health Check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify Spotify auth
+        run: python3 export.py --check
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          NOTIFICATION_WEBHOOK_URL: ${{ secrets.NOTIFICATION_WEBHOOK_URL }}
+        run: |
+          [ -z "$NOTIFICATION_WEBHOOK_URL" ] && exit 0
+          curl -sf -X POST "$NOTIFICATION_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "Title: Spotify Token Check FAILED" \
+            -d '{"text":"Spotify auth token is invalid or expired. Re-run --setup locally.","content":"Spotify auth token is invalid or expired. Re-run --setup locally."}'

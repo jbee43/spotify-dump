@@ -1,0 +1,151 @@
+name: Export Spotify Data
+
+on:
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Save previous stats
+        run: |
+          if [ -f data/stats.json ]; then
+            cp data/stats.json /tmp/prev_stats.json
+          fi
+
+      - name: Run export
+        run: python3 export.py
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
+
+      - name: Compute diff summary
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+
+          curr_path = "data/stats.json"
+          prev_path = "/tmp/prev_stats.json"
+
+          summary = "First export"
+          if os.path.exists(curr_path):
+              curr = json.load(open(curr_path))
+              prev = json.load(open(prev_path)) if os.path.exists(prev_path) else {}
+
+              parts = []
+              for key in ["liked_songs", "saved_albums", "followed_artists", "playlists"]:
+                  old_val = prev.get(key, 0)
+                  new_val = curr.get(key, 0)
+                  diff = new_val - old_val
+                  label = key.replace("_", " ")
+                  if diff > 0:
+                      parts.append(f"{label}: +{diff} (now {new_val})")
+                  elif diff < 0:
+                      parts.append(f"{label}: {diff} (now {new_val})")
+                  else:
+                      parts.append(f"{label}: {new_val}")
+              summary = " | ".join(parts)
+
+          with open("/tmp/diff_summary.txt", "w") as f:
+              f.write(summary)
+          PYEOF
+
+      - name: Commit and push changes
+        id: commit
+        run: |
+          git config user.name "Gitea Actions"
+          git config user.email "noreply@jb3o.icu"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "spotify export $(date -u '+%Y-%m-%d %H:%M:%S')"
+            git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify on changes
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          NOTIFICATION_WEBHOOK_URL: ${{ secrets.NOTIFICATION_WEBHOOK_URL }}
+        run: |
+          [ -z "$NOTIFICATION_WEBHOOK_URL" ] && exit 0
+          SUMMARY=$(cat /tmp/diff_summary.txt 2>/dev/null || echo "Data updated")
+          PAYLOAD=$(SUMMARY="$SUMMARY" python3 -c "import json,os; s=os.environ['SUMMARY']; print(json.dumps({'text':s,'content':s}))")
+          curl -sf -X POST "$NOTIFICATION_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "Title: Spotify Export Updated" \
+            -d "$PAYLOAD" || echo "Warning: notification delivery failed"
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          NOTIFICATION_WEBHOOK_URL: ${{ secrets.NOTIFICATION_WEBHOOK_URL }}
+        run: |
+          [ -z "$NOTIFICATION_WEBHOOK_URL" ] && exit 0
+          curl -sf -X POST "$NOTIFICATION_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -H "Title: Spotify Export FAILED" \
+            -d '{"text":"Export failed — check workflow logs.","content":"Export failed — check workflow logs."}'
+
+      - name: Create or update failure issue
+        if: failure()
+        env:
+          GITEA_URL: ${{ github.server_url }}
+          GITEA_REPO: ${{ github.repository }}
+          GITEA_TOKEN: ${{ github.token }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, urllib.request
+          from datetime import datetime, timezone
+
+          url = os.environ["GITEA_URL"]
+          repo = os.environ["GITEA_REPO"]
+          token = os.environ["GITEA_TOKEN"]
+          workflow = os.environ["WORKFLOW_NAME"]
+
+          api = f"{url}/api/v1/repos/{repo}"
+          headers = {
+              "Authorization": f"token {token}",
+              "Content-Type": "application/json",
+          }
+          title = f"[CI] {workflow} failed"
+          timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+          runs_url = f"{url}/{repo}/actions"
+          body = (
+              f"Workflow **{workflow}** failed at {timestamp} UTC.\n\n"
+              f"Check [workflow runs]({runs_url}) for details."
+          )
+
+          def api_call(endpoint, data=None):
+              req = urllib.request.Request(
+                  f"{api}/{endpoint}",
+                  data=json.dumps(data).encode() if data else None,
+                  headers=headers,
+                  method="POST" if data else "GET",
+              )
+              return json.loads(urllib.request.urlopen(req).read())
+
+          issues = api_call("issues?state=open&type=issues&limit=50")
+          existing = [i for i in issues if i["title"] == title]
+
+          if existing:
+              api_call(f"issues/{existing[0]['number']}/comments", {"body": body})
+              print(f"Added comment to issue #{existing[0]['number']}")
+          else:
+              result = api_call("issues", {"title": title, "body": body})
+              print(f"Created issue #{result['number']}: {title}")
+          PYEOF
